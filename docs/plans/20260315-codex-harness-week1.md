@@ -29,10 +29,10 @@
 
 ## 아키텍처/설계 방향
 - 핵심 설계:
-  - Ingress는 최소 채널 1개만 두고, 나머지 채널은 이후 주차로 미룬다.
+  - Ingress는 CLI 1개 채널로 시작하고, 나머지 채널은 이후 주차로 미룬다.
   - Session lifecycle과 Workspace lifecycle은 분리된 서비스로 둔다.
 - 대안 및 trade-off:
-  - REST를 먼저 만들면 외부 연동 확장이 쉽고, CLI를 먼저 만들면 검증 속도가 빠르다.
+  - REST를 먼저 만들면 외부 연동 확장이 쉽고, CLI를 먼저 만들면 검증 속도가 빠르다. Week 1은 CLI를 선택했다.
 - 리스크:
   - cleanup이 없으면 실패 요청이 workspace를 누적시킬 수 있다.
 
@@ -43,59 +43,76 @@
 - `[x]` 완료
 
 ### 1.1 프로젝트 골격
-- [ ] 오케스트레이터 모듈 디렉터리 구조 확정
+- [x] 오케스트레이터 모듈 디렉터리 구조 확정
   - 설계 기준: Ingress, Orchestrator, Adapter, Workspace 계층 분리
-  - 산출물: 패키지/모듈 초안
-- [ ] `config.toml` 초안 생성
+  - 산출물: `src/forgeflow_harness/{cli,orchestrator,adapter,session,workspace,trace}.py`
+- [x] `config.toml` 초안 생성
   - 설계 기준: guardrail default, session policy, workspace limit, integration endpoint 분리
-  - 산출물: 기본 설정 파일
-- [ ] 애플리케이션 시작 시 설정 로더 연결
+  - 산출물: `config.toml`
+- [x] 애플리케이션 시작 시 설정 로더 연결
   - 설계 기준: 하드코딩 대신 설정 주입
-  - 산출물: config parser + bootstrap wiring
+  - 산출물: `src/forgeflow_harness/config.py`, `src/forgeflow_harness/cli.py`
 
 ### 1.2 Ingress 최소 진입점
-- [ ] CLI 또는 REST 중 하나를 1차 ingress로 선택
+- [x] CLI 또는 REST 중 하나를 1차 ingress로 선택
   - 설계 기준: 초기 검증은 채널 1개면 충분
-  - 산출물: 선택 근거 기록
-- [ ] request payload DTO 정의
+  - 산출물: CLI 선택, `argparse` 기반 진입점
+- [x] request payload DTO 정의
   - 설계 기준: `request_id`, `repo`, `goal`, `constraints` 유지
-  - 산출물: request schema
-- [ ] intake endpoint/command 구현
+  - 산출물: `HarnessRequest`
+- [x] intake endpoint/command 구현
   - 설계 기준: 요청 수신 후 내부 workflow 시작 이벤트 발생
-  - 산출물: ingress handler
-- [ ] 잘못된 request에 대한 validation 추가
+  - 산출물: `forgeflow-harness` CLI, `src/forgeflow_harness/cli.py`
+- [x] 잘못된 request에 대한 validation 추가
   - 설계 기준: 필수 필드 누락 방지
-  - 산출물: validation rule + 실패 응답
+  - 산출물: `HarnessRequest.validate()`, CLI constraint validation
 
 ### 1.3 Codex Adapter / Session Manager
-- [ ] Codex session client interface 정의
+- [x] Codex session client interface 정의
   - 설계 기준: `/sessions`, `/run`, `/reply`, `/approve`, `/events`, `/terminate` 캡슐화
-  - 산출물: adapter interface
-- [ ] session 생성 API 연결
+  - 산출물: `CodexAdapter`
+- [x] session 생성 API 연결
   - 설계 기준: 요청 단위 session lifecycle 시작
-  - 산출물: create session flow
-- [ ] session event polling 또는 subscription 방식 결정
+  - 산출물: `SessionManager.create()`, `CodexAdapter.create_session()`
+- [/] session event polling 또는 subscription 방식 결정
   - 설계 기준: trace/event 수집 가능한 방식 선택
-  - 산출물: event fetch design note
-- [ ] session 종료 처리 구현
+  - 산출물: `CodexAdapter.stream_events()` 골격만 추가, 실제 polling 전략은 Week 1 후속 확정 필요
+- [x] session 종료 처리 구현
   - 설계 기준: 정상 종료와 실패 종료 분리
-  - 산출물: terminate flow
+  - 산출물: `SessionManager.terminate()`, 실패 cleanup 시 terminate 호출
 
 ### 1.4 Workspace Harness
-- [ ] repo checkout 책임 경계 정의
+- [x] repo checkout 책임 경계 정의
   - 설계 기준: clone/checkout/worktree 생성 책임을 workspace 계층에 고정
-  - 산출물: workspace manager interface
-- [ ] git worktree 생성 구현
+  - 산출물: `WorkspaceHarness`
+- [x] git worktree 생성 구현
   - 설계 기준: 요청별 독립 작업 공간 확보
-  - 산출물: worktree creation flow
-- [ ] branch naming 규칙 정의
+  - 산출물: `git worktree add -b ...`
+- [x] branch naming 규칙 정의
   - 설계 기준: request_id 기반 충돌 방지
-  - 산출물: branch naming helper
-- [ ] 작업 디렉터리 정리 정책 추가
+  - 산출물: `ff/<request_id>` 규칙
+- [x] 작업 디렉터리 정리 정책 추가
   - 설계 기준: 실패 시에도 orphan workspace 최소화
-  - 산출물: cleanup hook
+  - 산출물: `WorkspaceHarness.cleanup()`
 
 ### 1.5 Week 1 검증
-- [ ] 샘플 request로 session 생성까지 확인
-- [ ] 샘플 request로 worktree 생성까지 확인
-- [ ] 실패 시 session/workspace 정리 여부 확인
+- [x] 샘플 request로 session 생성까지 확인
+  - 검증: `python3 -m unittest discover -s tests -v`의 happy path 테스트
+- [x] 샘플 request로 worktree 생성까지 확인
+  - 검증: 임시 git repo에서 worktree 생성 확인
+- [x] 실패 시 session/workspace 정리 여부 확인
+  - 검증: run 실패 시 terminate + worktree cleanup 테스트
+
+## 현재 진행 요약
+- 완료:
+  - Python 3.11+ 패키지 골격 추가
+  - `config.toml` 및 설정 로더 연결
+  - CLI ingress 구현
+  - Codex Adapter / Session Manager / Workspace Harness 골격 구현
+  - structured logging 및 trace append 저장 구현
+  - `unittest` 기반 Week 1 핵심 시나리오 검증
+- 진행 중:
+  - 실제 Codex App Server 응답 스키마에 맞춘 event polling 전략 확정
+- 다음 액션:
+  - 실제 Codex App Server와 연결해 `/sessions/{id}/events` payload shape 검증
+  - trace event를 내부 상태와 매핑하는 규칙을 Week 2 상태 머신 설계와 정렬

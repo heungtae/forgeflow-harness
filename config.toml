@@ -1,0 +1,21 @@
+[codex]
+base_url = "http://127.0.0.1:8000"
+timeout_seconds = 30
+session_name = "forgeflow-week1"
+
+[workspace]
+root_dir = ".forgeflow/workspaces"
+base_branch = "main"
+branch_prefix = "ff"
+cleanup_on_failure = true
+max_workspaces = 10
+
+[validation]
+commands = [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]]
+
+[trace]
+output_path = ".forgeflow/traces/trace.jsonl"
+
+[logging]
+level = "INFO"
+logger_name = "forgeflow_harness"
