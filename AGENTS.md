@@ -1,54 +1,190 @@
 # AGENTS.md
 
-## 목적
-이 저장소에서 Codex CLI가 일관되고 안전하게 작업하도록 기본 규칙을 제공합니다.
+## Purpose
 
-## 작업 목표
-- 기존 아키텍처를 존중하면서 변경 범위를 최소화한다.
-- 변경 이유와 영향 범위를 항상 설명한다.
-- 테스트 가능한 단위로 작은 패치를 우선한다.
+This repository contains a Python-based harness project used to
+orchestrate AI agents that perform engineering tasks such as planning,
+coding, testing, reviewing, and documenting.
 
-## 필수 규칙
-1. 먼저 관련 파일과 유사 구현을 찾고, 그 다음 수정한다.
-2. 추측해서 새 패턴을 만들지 말고 기존 패턴을 따른다.
-3. 한 번에 너무 많은 파일을 바꾸지 않는다.
-4. 공용 API, DB 스키마, 운영 설정 변경은 명시 요청이 있을 때만 한다.
-5. 테스트나 검증 명령을 실행하기 전 무엇을 검증하는지 짧게 설명한다.
+Agents operating in this repository must behave like engineering
+contributors, not simple code generators. They must produce traceable,
+testable, and reviewable work.
 
-## 변경 전 확인
-- 요구사항 요약 3줄 이내
-- 관련 파일 후보
-- 예상 변경 파일 수
-- 필요한 검증 명령
+------------------------------------------------------------------------
 
-## 선호 구현 방식
-- 같은 계층의 기존 코드 스타일을 우선 복제한다.
-- 예외 처리, 로깅, 테스트 작성 방식은 저장소의 관례를 따른다.
-- 리팩터링은 기능 변경과 분리한다.
-- Plan mode에서 설계한 내용은 반드시 `./docs/` 하위에 문서로 저장한다.
-- Plan mode로 설계가 끝난 작업은 해당 설계를 기준으로 implementation까지 이어서 수행한다.
+## Core Principles
 
-## 금지 사항
-- 비밀값, 토큰, 인증정보를 코드/로그/문서에 남기지 않는다.
-- 관련 없는 포맷팅 대량 변경 금지
-- `main`, `release/*` 직접 푸시 금지
-- 운영 설정 파일 임의 수정 금지
-- 외부 네트워크 의존 명령을 무단 실행 금지
+1.  Plan before coding
+2.  Break work into small tasks
+3.  Respect the existing architecture
+4.  Produce testable code
+5.  Leave traceable execution logs
+6.  Document decisions and risks
 
-## 응답 형식
-작업이 끝나면 아래 순서로 요약한다.
-1. 무엇을 변경했는지
-2. 왜 변경했는지
-3. 어떤 검증을 했는지
-4. 남은 리스크가 무엇인지
+------------------------------------------------------------------------
 
-## Python 추가 규칙
-- `async` 경로에서는 blocking call(`time.sleep()`, 동기 I/O, 동기 HTTP/DB 클라이언트) 사용 금지
-- 기존 예외 매핑과 응답 포맷, 직렬화 스키마를 유지한다
-- 테스트는 happy path 외에 실패 케이스를 최소 1개 포함한다
-- 신규 public interface(API, CLI, 모듈 export)는 backward compatibility를 고려한다
+## Agent Roles
 
-## Sonar / 품질 규칙
-- 신규 코드에 major issue를 만들지 않는다.
-- 의미 없는 suppression 추가 금지
-- null/예외/경계값 처리 누락 금지
+### Orchestrator
+
+Responsible for: - requirement interpretation - task decomposition -
+workflow orchestration - result summarization - handoff documentation
+
+### Coder
+
+Responsible for: - implementing tasks - writing tests - adding logging
+and error handling
+
+### Reviewer
+
+Responsible for: - validating requirement coverage - ensuring code
+quality - detecting architectural risks
+
+### Test Agent
+
+Responsible for: - validating tests - checking edge cases - verifying
+reproducibility
+
+------------------------------------------------------------------------
+
+## Standard Workflow
+
+1.  Understand the request
+2.  Plan the tasks
+3.  Implement changes
+4.  Validate through tests
+5.  Review the changes
+6.  Produce a handoff summary
+
+------------------------------------------------------------------------
+
+## Task Decomposition Rules
+
+A valid task: - has a clear goal - is independently testable - has a
+defined input/output
+
+Example tasks: - implement config loader - add execution trace model -
+implement agent registry - add workflow dispatcher
+
+------------------------------------------------------------------------
+
+## Coding Rules
+
+Python Version: **3.11+**
+
+Default agent framework: **OpenAI Agent SDK**
+
+Agents should build new orchestration, agent coordination, and task
+execution features on top of the OpenAI Agent SDK by default. If a
+different framework or custom runtime is required, the reason and
+tradeoffs must be documented in the task handoff.
+
+Guidelines: - small functions - clear naming - avoid hidden side
+effects - use type hints - prefer dataclasses or pydantic models -
+structured logging instead of print
+
+Recommended libraries: - pytest - pydantic - httpx - tenacity
+
+------------------------------------------------------------------------
+
+## Error Handling
+
+-   never silently ignore exceptions
+-   distinguish recoverable vs fatal errors
+-   retry external calls when appropriate
+-   log root cause information
+
+------------------------------------------------------------------------
+
+## Logging
+
+Every meaningful step should log:
+
+-   task start
+-   task completion
+-   external calls
+-   retries
+-   failures
+
+Sensitive data must never be logged.
+
+------------------------------------------------------------------------
+
+## Execution Trace
+
+Each task execution should record:
+
+-   request_id
+-   task_id
+-   agent_role
+-   status
+-   start_time
+-   end_time
+-   changed_files
+-   validation_result
+
+Example:
+
+{ "request_id": "REQ-001", "task_id": "TASK-01", "agent_role": "coder",
+"status": "completed" }
+
+------------------------------------------------------------------------
+
+## Testing Rules
+
+Required whenever possible:
+
+-   unit tests
+-   edge case tests
+-   failure tests
+
+Test naming example:
+
+test_should_create_task_plan_when_request_valid
+
+------------------------------------------------------------------------
+
+## Guardrails
+
+Agents must NOT:
+
+-   introduce unrelated features
+-   perform large refactors without reason
+-   add unnecessary dependencies
+-   hide failures
+-   log secrets
+
+------------------------------------------------------------------------
+
+## Handoff Template
+
+Summary: What was implemented
+
+Reason: Why the change was necessary
+
+Files Changed: List of modified files
+
+Validation: Test results
+
+Risks: Remaining risks
+
+Next Step: Suggested follow-up tasks
+
+------------------------------------------------------------------------
+
+## Definition of Done
+
+A task is complete when:
+
+-   requirements are met
+-   code is implemented
+-   tests pass
+-   validation completed
+-   handoff written
+
+------------------------------------------------------------------------
+
+## Final Rule
+
+Agents in this repository must act like disciplined engineers: produce
+structured, traceable, and reviewable work.
