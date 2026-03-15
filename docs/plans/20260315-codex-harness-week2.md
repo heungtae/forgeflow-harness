@@ -139,11 +139,13 @@
   - append-only trace 저장과 CLI ingress 연결
   - 고정 3-step decomposition, task graph validation, workflow 상태 전이 구현
   - generic adapter run payload, worktree 내부 validation runner, validation artifact trace 저장 구현
-  - `unittest` 기반 success / validation failure / task failure / trace artifact 시나리오 검증
+  - Codex event stream polling 기반 task 완료/실패/timeout 판정 구현
+  - validation profile 설정, repo 매핑, request constraint 우선순위 선택 로직 구현
+  - `unittest` 기반 success / validation failure / task failure / timeout / profile selection / trace artifact 시나리오 검증
 - 진행 중:
   - decomposition은 아직 Codex 기반 planner가 아니라 로컬 고정 3-step 정책이다.
-  - task 성공 판정은 event stream 해석이 아니라 `start_run()` 호출 성공 기준이다.
+  - event terminal 판정은 현재 느슨한 heuristic(`type`/`status`/`event`)에 의존하며 실제 Codex payload shape 검증이 더 필요하다.
 - 다음 액션:
-  - Codex event stream을 task 완료 판정과 연결
-  - repo별 validation command profile 또는 설정 분리 전략 추가
+  - 실제 Codex App Server `/sessions/{id}/events` payload shape에 맞춰 terminal event classifier를 고정
+  - repo별 validation profile 자동 선택 규칙을 repo 이름 매핑 외 방식으로 확장할지 결정
   - Week 3 reviewer/fixer/guardrail 설계와 상태 전이 연결

@@ -35,12 +35,17 @@ class HarnessConfig:
     codex_base_url: str
     codex_timeout_seconds: int
     codex_session_name: str
+    codex_event_poll_interval_seconds: float
+    codex_event_poll_max_attempts: int
     workspace_root_dir: Path
     workspace_base_branch: str
     workspace_branch_prefix: str
     workspace_cleanup_on_failure: bool
     workspace_max_workspaces: int
     validation_commands: list[list[str]]
+    validation_profiles: dict[str, list[list[str]]]
+    validation_default_profile: str
+    validation_repo_profiles: dict[str, str]
     trace_output_path: Path
     log_level: str
     logger_name: str
@@ -145,6 +150,16 @@ class WorkflowRun:
 
 
 @dataclass(slots=True)
+class TaskExecutionResult:
+    task_id: str
+    status: str
+    run_id: str
+    terminal_event_type: str
+    terminal_payload: dict[str, Any] = field(default_factory=dict)
+    event_count: int = 0
+
+
+@dataclass(slots=True)
 class TraceEvent:
     request_id: str
     task_id: str | None
@@ -164,4 +179,5 @@ class RunResult:
     status: str
     message: str
     task_graph: TaskGraph | None = None
+    task_results: list[TaskExecutionResult] = field(default_factory=list)
     validation_results: list[ValidationResult] = field(default_factory=list)
