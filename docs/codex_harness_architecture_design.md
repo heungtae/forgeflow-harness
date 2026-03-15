@@ -16,7 +16,7 @@ The Codex App Server acts as the execution engine while the orchestration servic
 ## 2. High-Level Architecture
 
 ```
-User / Jira / Portal
+User / Github Issue / Jira / Web 
         |
         v
 Ingress API (Task Intake)
@@ -45,9 +45,8 @@ Workspace Harness
 
 ### 3.1 Ingress Layer
 Receives requests from:
-- Jira webhook
-- Internal portal
-- Slack command
+- Github Issue
+- CLI
 - REST API
 
 Example request format:
@@ -74,6 +73,9 @@ Responsibilities:
 
 States:
 NEW → DECOMPOSED → CODING → VALIDATING → REVIEWING → NEEDS_FIX → READY_FOR_PR → DONE
+
+Runtime settings for the orchestrator should be defined in `config.toml`.
+This file should own guardrail defaults, session policies, workspace limits, and integration endpoints.
 
 ### 3.3 Codex Adapter
 Abstracts interaction with Codex App Server.
@@ -163,6 +165,8 @@ Denied:
 - Linter must pass
 - Unit tests must pass
 - Static analysis must pass
+
+The guardrail and execution policy rules above should be loaded from `config.toml` so the harness can be tuned without changing code.
 
 ## 6. Execution Trace
 
