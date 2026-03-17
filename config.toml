@@ -4,6 +4,8 @@ timeout_seconds = 30
 session_name = "forgeflow-week1"
 event_poll_interval_seconds = 1.0
 event_poll_max_attempts = 30
+terminal_success_types = ["run_completed", "task_completed", "completed"]
+terminal_failure_types = ["run_failed", "task_failed", "failed", "error"]
 
 [workspace]
 root_dir = ".forgeflow/workspaces"
@@ -20,6 +22,18 @@ commands = [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]]
 
 [validation.repo_profiles]
 forgeflow-harness = "python-unittest"
+
+[review]
+max_rounds = 2
+required_reviewer_decision_fields = ["review_decision|decision|result", "summary"]
+
+[guardrail]
+command_rules = [
+  { pattern = "python3 -m unittest *", action = "allow", reason = "default unittest validation" },
+]
+file_rules = []
+runtime_observation_enabled = true
+approval_timeout_seconds = 86400
 
 [trace]
 output_path = ".forgeflow/traces/trace.jsonl"

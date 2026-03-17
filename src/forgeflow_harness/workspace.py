@@ -77,6 +77,25 @@ class WorkspaceHarness:
                 break
         return results
 
+    def list_changed_files(self, worktree_path: Path) -> list[str]:
+        completed = subprocess.run(
+            ["git", "status", "--short", "--untracked-files=all"],
+            cwd=worktree_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            raise WorkspaceError(f"git status --short --untracked-files=all failed: {stderr}")
+
+        changed_files: list[str] = []
+        for line in completed.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            changed_files.append(line[3:].strip())
+        return changed_files
+
     def _branch_name(self, request_id: str) -> str:
         sanitized = re.sub(r"[^a-zA-Z0-9._-]+", "-", request_id).strip("-")
         return f"{self._branch_prefix}/{sanitized}"

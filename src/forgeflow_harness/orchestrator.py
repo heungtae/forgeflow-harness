@@ -3,12 +3,20 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from forgeflow_harness.adapter import CodexAdapter, CodexAdapterError
+from forgeflow_harness.guardrails import GuardrailEngine
 from forgeflow_harness.models import (
+    ApprovalRecord,
+    GuardrailDecision,
     HarnessConfig,
     HarnessRequest,
+    NormalizedEvent,
+    ObservedAction,
+    ReviewDecision,
     RunResult,
     SessionHandle,
     TaskGraph,
@@ -20,9 +28,17 @@ from forgeflow_harness.models import (
     WorkspaceHandle,
     utc_now,
 )
+from forgeflow_harness.normalizer import EventNormalizer
 from forgeflow_harness.session import SessionManager
 from forgeflow_harness.trace import TraceRepository
 from forgeflow_harness.workspace import WorkspaceError, WorkspaceHarness
+
+
+class ApprovalRequiredPause(RuntimeError):
+    def __init__(self, decision: GuardrailDecision, approval_record: ApprovalRecord | None = None) -> None:
+        super().__init__(decision.reason)
+        self.decision = decision
+        self.approval_record = approval_record
 
 
 class HarnessOrchestrator:
@@ -39,6 +55,9 @@ class HarnessOrchestrator:
         self._adapter = adapter
         self._session_manager = SessionManager(adapter)
         self._workspace_harness = WorkspaceHarness(config)
+        self._guardrails = GuardrailEngine(config.guardrail_command_rules, config.guardrail_file_rules)
+        self._event_normalizer = EventNormalizer()
+        self._latest_approval_record: ApprovalRecord | None = None
 
     def run(self, harness_request: HarnessRequest) -> RunResult:
         session: SessionHandle | None = None
@@ -46,7 +65,11 @@ class HarnessOrchestrator:
         task_graph: TaskGraph | None = None
         task_results: list[TaskExecutionResult] = []
         validation_results: list[ValidationResult] = []
+        review_decisions: list[ReviewDecision] = []
+        pending_approval: GuardrailDecision | None = None
+        approval_record: ApprovalRecord | None = None
         state = WorkflowState.NEW
+        self._latest_approval_record = None
 
         self._emit_event(harness_request, "request_received", {})
         self._log("request received", harness_request, None, None, "started")
@@ -80,34 +103,16 @@ class HarnessOrchestrator:
             state = self._transition_state(harness_request, state, WorkflowState.DECOMPOSED)
             state = self._transition_state(harness_request, state, WorkflowState.CODING)
             task_results = self._run_task_graph(harness_request, session, workspace, task_graph)
-
-            state = self._transition_state(harness_request, state, WorkflowState.VALIDATING)
-            validation_profile = self._select_validation_profile(harness_request, workspace.repo_path)
-            validation_commands = self._config.validation_profiles[validation_profile]
-            self._emit_event(
+            state, validation_results, review_decisions, pending_approval = self._run_review_cycle(
                 harness_request,
-                "validation_started",
-                {"profile_name": validation_profile, "commands": validation_commands},
+                session,
+                workspace,
+                state,
+                task_graph,
             )
-            validation_results = self._workspace_harness.run_validation(
-                validation_commands,
-                workspace.worktree_path,
-            )
-            self._emit_event(
-                harness_request,
-                "validation_finished",
-                {"results": [self._serialize_validation_result(result) for result in validation_results]},
-                validation_result="passed" if self._validation_succeeded(validation_results) else "failed",
-            )
-
-            if self._validation_succeeded(validation_results):
-                state = self._transition_state(harness_request, state, WorkflowState.DONE)
-                session.status = WorkflowState.DONE.value
-                message = "task graph executed and validation passed"
-            else:
-                state = self._transition_state(harness_request, state, WorkflowState.NEEDS_FIX)
-                session.status = WorkflowState.NEEDS_FIX.value
-                message = "task graph executed but validation failed"
+            session.status = state.value
+            message = self._result_message(state, validation_results, pending_approval)
+            approval_record = self._latest_approval_record
 
             return RunResult(
                 request=harness_request,
@@ -118,6 +123,28 @@ class HarnessOrchestrator:
                 task_graph=task_graph,
                 task_results=task_results,
                 validation_results=validation_results,
+                review_decisions=review_decisions,
+                pending_approval=pending_approval,
+                approval_record=approval_record,
+            )
+        except ApprovalRequiredPause as exc:
+            state = WorkflowState.AWAITING_APPROVAL
+            pending_approval = exc.decision
+            if session is not None:
+                session.status = state.value
+                approval_record = exc.approval_record or self._latest_approval_record
+            return RunResult(
+                request=harness_request,
+                session=session,
+                workspace=workspace,
+                status=state.value,
+                message=self._result_message(state, validation_results, pending_approval),
+                task_graph=task_graph,
+                task_results=task_results,
+                validation_results=validation_results,
+                review_decisions=review_decisions,
+                pending_approval=pending_approval,
+                approval_record=approval_record,
             )
         except (ValueError, WorkspaceError, CodexAdapterError) as exc:
             state = WorkflowState.FAILED
@@ -133,6 +160,9 @@ class HarnessOrchestrator:
                 task_graph=task_graph,
                 task_results=task_results,
                 validation_results=validation_results,
+                review_decisions=review_decisions,
+                pending_approval=pending_approval,
+                approval_record=approval_record,
             )
 
     def _cleanup(
@@ -177,10 +207,17 @@ class HarnessOrchestrator:
                 "task_started",
                 {"task": self._serialize_task(task)},
                 task_id=task.id,
+                session_id=session.session_id,
+                workflow_state=WorkflowState.CODING,
             )
-            run_response = self._adapter.start_run(
-                session.session_id,
-                {
+            task_result = self._run_agent(
+                harness_request,
+                session,
+                workspace,
+                agent_role="coder",
+                task_id=task.id,
+                workflow_state=WorkflowState.CODING,
+                input_payload={
                     "task_id": task.id,
                     "task_goal": task.goal,
                     "request_goal": harness_request.goal,
@@ -189,14 +226,6 @@ class HarnessOrchestrator:
                     "constraints": harness_request.constraints,
                 },
             )
-            run_id = self._extract_run_id(run_response)
-            self._emit_event(
-                harness_request,
-                "run_started",
-                {"task_id": task.id, "run_id": run_id},
-                task_id=task.id,
-            )
-            task_result = self._wait_for_task_terminal_event(harness_request, session.session_id, task.id, run_id)
             task.status = "completed"
             self._emit_event(
                 harness_request,
@@ -208,102 +237,426 @@ class HarnessOrchestrator:
                     "event_count": task_result.event_count,
                 },
                 task_id=task.id,
+                session_id=session.session_id,
+                run_id=task_result.run_id,
+                workflow_state=WorkflowState.CODING,
             )
             task_results.append(task_result)
         return task_results
 
+    def _run_review_cycle(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workspace: WorkspaceHandle,
+        state: WorkflowState,
+        task_graph: TaskGraph,
+    ) -> tuple[WorkflowState, list[ValidationResult], list[ReviewDecision], GuardrailDecision | None]:
+        review_decisions: list[ReviewDecision] = []
+        validation_results: list[ValidationResult] = []
+        latest_pending: GuardrailDecision | None = None
+        current_state = state
+
+        for round_index in range(self._config.review_max_rounds + 1):
+            current_state = self._transition_state(harness_request, current_state, WorkflowState.VALIDATING)
+            current_state, validation_results, latest_pending = self._run_validation(
+                harness_request,
+                session,
+                workspace,
+                current_state,
+            )
+            if current_state in {WorkflowState.AWAITING_APPROVAL, WorkflowState.FAILED, WorkflowState.NEEDS_FIX}:
+                return current_state, validation_results, review_decisions, latest_pending
+
+            current_state = self._transition_state(harness_request, current_state, WorkflowState.REVIEWING)
+            review_decision = self._run_reviewer(harness_request, session, workspace, task_graph, validation_results, round_index)
+            review_decisions.append(review_decision)
+            if review_decision.decision == "pass":
+                current_state = self._transition_state(harness_request, current_state, WorkflowState.DONE)
+                return current_state, validation_results, review_decisions, latest_pending
+
+            if review_decision.decision == "blocked":
+                pending = GuardrailDecision(action="approval_required", reason=review_decision.summary, matched_rule=None)
+                current_state = self._transition_state(harness_request, current_state, WorkflowState.AWAITING_APPROVAL)
+                self._emit_pending_approval(harness_request, session, current_state, pending, None, guardrail_phase="runtime")
+                return current_state, validation_results, review_decisions, pending
+
+            if round_index >= self._config.review_max_rounds:
+                self._emit_event(
+                    harness_request,
+                    "review_round_limit_reached",
+                    {"round": round_index + 1, "max_rounds": self._config.review_max_rounds},
+                    session_id=session.session_id,
+                    workflow_state=current_state,
+                )
+                current_state = self._transition_state(harness_request, current_state, WorkflowState.FAILED)
+                return current_state, validation_results, review_decisions, latest_pending
+
+            current_state = self._transition_state(harness_request, current_state, WorkflowState.FIXING)
+            self._run_fixer(harness_request, session, workspace, task_graph, review_decision, round_index)
+
+        current_state = self._transition_state(harness_request, current_state, WorkflowState.FAILED)
+        return current_state, validation_results, review_decisions, latest_pending
+
+    def _run_validation(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workspace: WorkspaceHandle,
+        state: WorkflowState,
+    ) -> tuple[WorkflowState, list[ValidationResult], GuardrailDecision | None]:
+        changed_files = self._workspace_harness.list_changed_files(workspace.worktree_path)
+        pending = self._check_file_guardrails(harness_request, session, state, changed_files)
+        if pending is not None:
+            return WorkflowState.AWAITING_APPROVAL, [], pending
+
+        validation_profile = self._select_validation_profile(harness_request, workspace.repo_path)
+        validation_commands = self._config.validation_profiles[validation_profile]
+        for command in validation_commands:
+            pending = self._check_command_guardrails(harness_request, session, state, command)
+            if pending is not None:
+                return WorkflowState.AWAITING_APPROVAL, [], pending
+
+        self._emit_event(
+            harness_request,
+            "validation_started",
+            {"profile_name": validation_profile, "commands": validation_commands},
+            session_id=session.session_id,
+            workflow_state=state,
+            changed_files=changed_files,
+        )
+        validation_results = self._workspace_harness.run_validation(
+            validation_commands,
+            workspace.worktree_path,
+        )
+        self._emit_event(
+            harness_request,
+            "validation_finished",
+            {"results": [self._serialize_validation_result(result) for result in validation_results]},
+            session_id=session.session_id,
+            workflow_state=state,
+            validation_result="passed" if self._validation_succeeded(validation_results) else "failed",
+            changed_files=changed_files,
+        )
+        if self._validation_succeeded(validation_results):
+            return state, validation_results, None
+        return WorkflowState.NEEDS_FIX, validation_results, None
+
+    def _run_reviewer(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workspace: WorkspaceHandle,
+        task_graph: TaskGraph,
+        validation_results: list[ValidationResult],
+        round_index: int,
+    ) -> ReviewDecision:
+        changed_files = self._workspace_harness.list_changed_files(workspace.worktree_path)
+        self._emit_event(
+            harness_request,
+            "review_started",
+            {"round": round_index + 1, "task_count": len(task_graph.tasks)},
+            session_id=session.session_id,
+            workflow_state=WorkflowState.REVIEWING,
+            changed_files=changed_files,
+        )
+        task_result = self._run_agent(
+            harness_request,
+            session,
+            workspace,
+            agent_role="reviewer",
+            task_id=None,
+            workflow_state=WorkflowState.REVIEWING,
+            input_payload={
+                "role": "reviewer",
+                "request_id": harness_request.request_id,
+                "request_goal": harness_request.goal,
+                "workspace_path": str(workspace.worktree_path),
+                "changed_files": changed_files,
+                "task_graph": [self._serialize_task(task) for task in task_graph.tasks],
+                "validation_results": [self._serialize_validation_result(result) for result in validation_results],
+                "round": round_index + 1,
+            },
+        )
+        try:
+            review_decision = self._extract_review_decision(task_result.terminal_payload)
+        except CodexAdapterError as exc:
+            self._emit_event(
+                harness_request,
+                "decision_parse_failed",
+                {"error": str(exc), "terminal_payload": task_result.terminal_payload},
+                session_id=session.session_id,
+                run_id=task_result.run_id,
+                workflow_state=WorkflowState.REVIEWING,
+                changed_files=changed_files,
+                terminal_reason="decision_parse_failed",
+            )
+            raise
+        self._emit_event(
+            harness_request,
+            "review_finished",
+            {"decision": asdict(review_decision), "round": round_index + 1},
+            session_id=session.session_id,
+            run_id=task_result.run_id,
+            workflow_state=WorkflowState.REVIEWING,
+            changed_files=changed_files,
+        )
+        return review_decision
+
+    def _run_fixer(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workspace: WorkspaceHandle,
+        task_graph: TaskGraph,
+        review_decision: ReviewDecision,
+        round_index: int,
+    ) -> None:
+        changed_files = self._workspace_harness.list_changed_files(workspace.worktree_path)
+        self._emit_event(
+            harness_request,
+            "fix_started",
+            {"round": round_index + 1, "findings": review_decision.findings},
+            session_id=session.session_id,
+            workflow_state=WorkflowState.FIXING,
+            changed_files=changed_files,
+        )
+        task_result = self._run_agent(
+            harness_request,
+            session,
+            workspace,
+            agent_role="fixer",
+            task_id=None,
+            workflow_state=WorkflowState.FIXING,
+            input_payload={
+                "role": "fixer",
+                "request_id": harness_request.request_id,
+                "request_goal": harness_request.goal,
+                "workspace_path": str(workspace.worktree_path),
+                "changed_files": changed_files,
+                "task_graph": [self._serialize_task(task) for task in task_graph.tasks],
+                "review_decision": asdict(review_decision),
+                "round": round_index + 1,
+            },
+        )
+        self._emit_event(
+            harness_request,
+            "fix_finished",
+            {"round": round_index + 1, "run_id": task_result.run_id},
+            session_id=session.session_id,
+            run_id=task_result.run_id,
+            workflow_state=WorkflowState.FIXING,
+            changed_files=self._workspace_harness.list_changed_files(workspace.worktree_path),
+        )
+
+    def _run_agent(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workspace: WorkspaceHandle,
+        agent_role: str,
+        task_id: str | None,
+        workflow_state: WorkflowState,
+        input_payload: dict[str, object],
+    ) -> TaskExecutionResult:
+        run_response = self._adapter.start_run(
+            session.session_id,
+            {"role": agent_role, **input_payload},
+        )
+        run_id = self._extract_run_id(run_response)
+        self._emit_event(
+            harness_request,
+            "run_started",
+            {"task_id": task_id, "run_id": run_id, "agent_role": agent_role},
+            task_id=task_id,
+            session_id=session.session_id,
+            run_id=run_id,
+            workflow_state=workflow_state,
+            changed_files=self._workspace_harness.list_changed_files(workspace.worktree_path),
+        )
+        return self._wait_for_task_terminal_event(
+            harness_request,
+            session,
+            workspace,
+            task_id,
+            run_id,
+            agent_role,
+            workflow_state,
+        )
+
     def _extract_run_id(self, run_response: dict[str, object]) -> str:
-        run_id = run_response.get("id")
-        if not isinstance(run_id, str) or not run_id:
+        run_id = self._extract_first_str(run_response, ["id"], ["run_id"], ["run", "id"])
+        if run_id is None:
             raise CodexAdapterError("Codex run response did not include run id")
         return run_id
 
     def _wait_for_task_terminal_event(
         self,
         harness_request: HarnessRequest,
-        session_id: str,
-        task_id: str,
+        session: SessionHandle,
+        workspace: WorkspaceHandle,
+        task_id: str | None,
         run_id: str,
+        agent_role: str,
+        workflow_state: WorkflowState,
     ) -> TaskExecutionResult:
         seen_event_ids: set[str] = set()
         matched_event_count = 0
 
         for _ in range(self._config.codex_event_poll_max_attempts):
-            response = self._adapter.stream_events(session_id)
-            events = self._extract_events(response)
-            for index, event in enumerate(events):
-                event_id = self._event_id(event, index)
-                if event_id in seen_event_ids:
+            for event in self._event_normalizer.normalize_events(self._adapter.stream_events(session.session_id)):
+                if event.event_id in seen_event_ids:
                     continue
-                seen_event_ids.add(event_id)
+                seen_event_ids.add(event.event_id)
 
-                if not self._event_matches_task(event, task_id, run_id):
+                if not self._event_matches_task(event, task_id, run_id, agent_role):
                     continue
 
                 matched_event_count += 1
+                observed_action = self._extract_observed_action(event)
+                self._emit_event(
+                    harness_request,
+                    "agent_event_received",
+                    {
+                        "event_type": event.event_type,
+                        "agent_role": agent_role,
+                        "raw_event": event.raw_event,
+                    },
+                    task_id=task_id,
+                    session_id=session.session_id,
+                    run_id=run_id,
+                    workflow_state=workflow_state,
+                    normalized_event_type=event.event_type,
+                    observed_action=observed_action,
+                )
+                if observed_action is not None:
+                    self._check_runtime_observed_action(
+                        harness_request,
+                        session,
+                        workflow_state,
+                        observed_action,
+                    )
+
                 is_terminal, terminal_status = self._classify_terminal_event(event)
                 if not is_terminal:
                     continue
                 if terminal_status == "failed":
                     raise CodexAdapterError(
-                        f"task {task_id} failed with event {self._event_type(event)}"
+                        f"task {task_id or agent_role} failed with event {event.event_type}"
                     )
                 return TaskExecutionResult(
-                    task_id=task_id,
+                    task_id="" if task_id is None else task_id,
                     status="completed",
                     run_id=run_id,
-                    terminal_event_type=self._event_type(event),
-                    terminal_payload=event,
+                    terminal_event_type=event.event_type,
+                    terminal_payload=event.raw_event,
                     event_count=matched_event_count,
                 )
 
             if self._config.codex_event_poll_interval_seconds > 0:
                 time.sleep(self._config.codex_event_poll_interval_seconds)
 
-        raise CodexAdapterError(f"task {task_id} timed out waiting for terminal event")
+        raise CodexAdapterError(f"task {task_id or agent_role} timed out waiting for terminal event")
 
-    def _extract_events(self, response: object) -> list[dict[str, object]]:
-        if isinstance(response, list):
-            return [event for event in response if isinstance(event, dict)]
-        if isinstance(response, dict):
-            raw_events = response.get("events", [])
-            if isinstance(raw_events, list):
-                return [event for event in raw_events if isinstance(event, dict)]
+    def _extract_first_str(self, payload: dict[str, object], *paths: list[str]) -> str | None:
+        for path in paths:
+            value = self._extract_path(payload, path)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _extract_string_list(self, payload: dict[str, object], *paths: list[str]) -> list[str]:
+        for path in paths:
+            value = self._extract_path(payload, path)
+            if isinstance(value, list) and all(isinstance(item, str) and item for item in value):
+                return [item for item in value]
         return []
 
-    def _event_id(self, event: dict[str, object], index: int) -> str:
-        event_id = event.get("id")
-        if isinstance(event_id, str) and event_id:
-            return event_id
-        return f"{index}:{self._event_type(event)}"
+    def _extract_path(self, payload: dict[str, object], path: list[str]) -> object:
+        current: object = payload
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
 
-    def _event_matches_task(self, event: dict[str, object], task_id: str, run_id: str) -> bool:
-        payload = event.get("payload", {})
-        payload = payload if isinstance(payload, dict) else {}
+    def _event_matches_task(self, event: NormalizedEvent, task_id: str | None, run_id: str, agent_role: str) -> bool:
+        if event.run_id is not None:
+            return event.run_id == run_id
+        if task_id is not None and event.task_id is not None:
+            return event.task_id == task_id
+        if task_id is None and event.role is not None:
+            return event.role == agent_role
+        return False
 
-        event_task_id = event.get("task_id") or payload.get("task_id")
-        event_run_id = event.get("run_id") or payload.get("run_id")
-
-        if isinstance(event_task_id, str) and event_task_id and event_task_id != task_id:
-            return False
-        if isinstance(event_run_id, str) and event_run_id and event_run_id != run_id:
-            return False
-        return True
-
-    def _classify_terminal_event(self, event: dict[str, object]) -> tuple[bool, str]:
-        event_type = self._event_type(event)
-        if any(token in event_type for token in ("failed", "error")):
+    def _classify_terminal_event(self, event: NormalizedEvent) -> tuple[bool, str]:
+        candidates = {event.event_type}
+        if event.status is not None:
+            candidates.add(event.status)
+        if any(candidate in self._config.codex_terminal_failure_types for candidate in candidates):
             return True, "failed"
-        if any(token in event_type for token in ("completed", "succeeded", "success")):
+        if any(candidate in self._config.codex_terminal_success_types for candidate in candidates):
             return True, "completed"
         return False, "running"
 
-    def _event_type(self, event: dict[str, object]) -> str:
-        for key in ("type", "status", "event"):
-            value = event.get(key)
-            if isinstance(value, str) and value:
-                return value.lower()
-        return "unknown"
+    def _extract_observed_action(self, event: NormalizedEvent) -> ObservedAction | None:
+        if not self._config.guardrail_runtime_observation_enabled:
+            return None
+
+        command_argv = event.command_argv or event.tool_args
+        if command_argv:
+            return ObservedAction(
+                kind="command",
+                target=" ".join(command_argv),
+                details={"tool_name": event.tool_name or "command", "event_type": event.event_type},
+            )
+
+        tool_name = (event.tool_name or "").lower()
+        if event.tool_target is None:
+            return None
+        if tool_name in {"write_file", "edit_file"}:
+            return ObservedAction(kind="file_write", target=event.tool_target, details={"event_type": event.event_type})
+        if tool_name in {"delete_file", "remove_file"}:
+            return ObservedAction(kind="file_delete", target=event.tool_target, details={"event_type": event.event_type})
+        return None
+
+    def _check_runtime_observed_action(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workflow_state: WorkflowState,
+        observed_action: ObservedAction,
+    ) -> None:
+        if observed_action.kind == "command":
+            decision = self._guardrails.check_command(observed_action.target.split())
+        elif observed_action.kind in {"file_write", "file_delete"}:
+            decision = self._guardrails.check_files([observed_action.target])
+        else:
+            return
+
+        self._emit_event(
+            harness_request,
+            "guardrail_checked",
+            {"kind": observed_action.kind, "decision": asdict(decision), "targets": [observed_action.target]},
+            session_id=session.session_id,
+            workflow_state=workflow_state,
+            changed_files=[observed_action.target] if observed_action.kind.startswith("file") else [],
+            observed_action=observed_action,
+            guardrail_phase="runtime",
+        )
+        if decision.action == "deny":
+            raise WorkspaceError(f"guardrail denied runtime {observed_action.kind}: {decision.reason}")
+        if decision.action == "approval_required":
+            self._emit_pending_approval(
+                harness_request,
+                session,
+                workflow_state,
+                decision,
+                [observed_action.target],
+                observed_action=observed_action,
+                guardrail_phase="runtime",
+            )
+            raise ApprovalRequiredPause(decision, self._latest_approval_record)
 
     def _select_validation_profile(self, harness_request: HarnessRequest, repo_path: Path) -> str:
         requested_profile = harness_request.constraints.get("validation_profile")
@@ -351,19 +704,217 @@ class HarnessOrchestrator:
         status: str,
         payload: dict[str, object],
         task_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        workflow_state: WorkflowState | None = None,
+        changed_files: list[str] | None = None,
         validation_result: str | None = None,
+        normalized_event_type: str | None = None,
+        observed_action: ObservedAction | None = None,
+        guardrail_phase: str | None = None,
+        terminal_reason: str | None = None,
+        approval_status: str | None = None,
+        resume_from: str | None = None,
     ) -> None:
         event = TraceEvent(
             request_id=harness_request.request_id,
             task_id=task_id,
+            session_id=session_id,
+            run_id=run_id,
             agent_role="orchestrator",
             status=status,
+            workflow_state=None if workflow_state is None else workflow_state.value,
+            correlation_id=self._correlation_id(harness_request.request_id, task_id, run_id),
             timestamp=utc_now(),
             payload=payload,
-            changed_files=[],
+            changed_files=[] if changed_files is None else changed_files,
             validation_result=validation_result,
+            normalized_event_type=normalized_event_type,
+            observed_action=None if observed_action is None else asdict(observed_action),
+            guardrail_phase=guardrail_phase,
+            terminal_reason=terminal_reason,
+            approval_status=approval_status,
+            resume_from=resume_from,
         )
         self._trace_repository.append(event)
+
+    def _check_file_guardrails(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workflow_state: WorkflowState,
+        changed_files: list[str],
+    ) -> GuardrailDecision | None:
+        decision = self._guardrails.check_files(changed_files)
+        self._emit_event(
+            harness_request,
+            "guardrail_checked",
+            {"kind": "file", "decision": asdict(decision), "targets": changed_files},
+            session_id=session.session_id,
+            workflow_state=workflow_state,
+            changed_files=changed_files,
+            guardrail_phase="preflight",
+        )
+        if decision.action == "deny":
+            raise WorkspaceError(f"guardrail denied changed file access: {decision.reason}")
+        if decision.action == "approval_required":
+            self._emit_pending_approval(
+                harness_request,
+                session,
+                workflow_state,
+                decision,
+                changed_files,
+                guardrail_phase="preflight",
+            )
+            return decision
+        return None
+
+    def _check_command_guardrails(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workflow_state: WorkflowState,
+        command: list[str],
+    ) -> GuardrailDecision | None:
+        decision = self._guardrails.check_command(command)
+        self._emit_event(
+            harness_request,
+            "guardrail_checked",
+            {"kind": "command", "decision": asdict(decision), "targets": [" ".join(command)]},
+            session_id=session.session_id,
+            workflow_state=workflow_state,
+            guardrail_phase="preflight",
+        )
+        if decision.action == "deny":
+            raise WorkspaceError(f"guardrail denied command: {decision.reason}")
+        if decision.action == "approval_required":
+            self._emit_pending_approval(
+                harness_request,
+                session,
+                workflow_state,
+                decision,
+                command,
+                guardrail_phase="preflight",
+            )
+            return decision
+        return None
+
+    def _emit_pending_approval(
+        self,
+        harness_request: HarnessRequest,
+        session: SessionHandle,
+        workflow_state: WorkflowState,
+        decision: GuardrailDecision,
+        target: list[str] | None,
+        observed_action: ObservedAction | None = None,
+        guardrail_phase: str | None = None,
+    ) -> None:
+        approval_record = self._approval_record(session, workflow_state, decision, target, observed_action, guardrail_phase)
+        self._latest_approval_record = approval_record
+        self._emit_event(
+            harness_request,
+            "approval_pending",
+            {
+                "decision": asdict(decision),
+                "target": [] if target is None else target,
+                "approval_record": asdict(approval_record),
+            },
+            session_id=session.session_id,
+            workflow_state=workflow_state,
+            changed_files=[] if target is None else target,
+            observed_action=observed_action,
+            guardrail_phase=guardrail_phase,
+            approval_status="pending",
+        )
+
+    def _extract_review_decision(self, terminal_payload: dict[str, Any]) -> ReviewDecision:
+        normalized = self._event_normalizer.normalize(terminal_payload)
+        raw_decision = normalized.decision
+        summary = normalized.summary
+        missing_fields = self._missing_reviewer_fields(raw_decision, summary)
+        if missing_fields:
+            raise CodexAdapterError(
+                f"reviewer terminal event missing required field(s): {', '.join(missing_fields)}"
+            )
+
+        decision_map = {
+            "pass": "pass",
+            "approved": "pass",
+            "fix_required": "fix_required",
+            "changes_requested": "fix_required",
+            "blocked": "blocked",
+        }
+        decision = decision_map.get(raw_decision.lower())
+        if decision is None:
+            raise CodexAdapterError(f"unknown review decision: {raw_decision}")
+
+        findings = self._extract_string_list(terminal_payload, ["payload", "findings"], ["findings"])
+        suggested_actions = self._extract_string_list(
+            terminal_payload,
+            ["payload", "suggested_actions"],
+            ["suggested_actions"],
+        )
+        return ReviewDecision(
+            decision=decision,
+            summary=summary or f"review decision: {decision}",
+            findings=findings,
+            suggested_actions=suggested_actions,
+        )
+
+    def _missing_reviewer_fields(self, raw_decision: str | None, summary: str | None) -> list[str]:
+        missing: list[str] = []
+        for field_spec in self._config.review_required_reviewer_decision_fields:
+            aliases = [alias.strip() for alias in field_spec.split("|") if alias.strip()]
+            if any(alias in {"review_decision", "decision", "result"} for alias in aliases):
+                if raw_decision is None:
+                    missing.append(field_spec)
+                continue
+            if "summary" in aliases and summary is None:
+                missing.append(field_spec)
+        return missing
+
+    def _approval_record(
+        self,
+        session: SessionHandle,
+        workflow_state: WorkflowState,
+        decision: GuardrailDecision,
+        target: list[str] | None,
+        observed_action: ObservedAction | None,
+        guardrail_phase: str | None,
+    ) -> ApprovalRecord:
+        created_at = utc_now()
+        return ApprovalRecord(
+            request_id=session.request_id,
+            session_id=session.session_id,
+            workflow_state=workflow_state.value,
+            guardrail_phase=guardrail_phase,
+            action=decision.action,
+            reason=decision.reason,
+            target=[] if target is None else target,
+            observed_action=None if observed_action is None else asdict(observed_action),
+            created_at=created_at,
+            expires_at=created_at + timedelta(seconds=self._config.guardrail_approval_timeout_seconds),
+            status="pending",
+        )
+
+    def _result_message(
+        self,
+        state: WorkflowState,
+        validation_results: list[ValidationResult],
+        pending_approval: GuardrailDecision | None,
+    ) -> str:
+        if state == WorkflowState.DONE:
+            return "task graph executed, validation passed, and review completed"
+        if state == WorkflowState.AWAITING_APPROVAL and pending_approval is not None:
+            return f"workflow paused awaiting approval: {pending_approval.reason}"
+        if state == WorkflowState.NEEDS_FIX:
+            if validation_results:
+                return "task graph executed but validation failed"
+            return "workflow requires additional fixes"
+        return "workflow failed"
+
+    def _correlation_id(self, request_id: str, task_id: str | None, run_id: str | None) -> str:
+        return ":".join(part for part in [request_id, task_id, run_id] if part)
 
     def _log(
         self,
